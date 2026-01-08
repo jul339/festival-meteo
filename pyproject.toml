@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "festivals-meteo-pyspark"
+version = "0.1.0"
+description = "Agrégation de données SIBIL, météo Météo-France et données territoriales avec PySpark"
+authors = [
+    { name = "Votre Nom", email = "votre.email@example.com" }
+]
+readme = "README.md"
+requires-python = ">=3.9,<3.11"
+
+dependencies = [
+    # PySpark (compatible Java 11)
+    "pyspark==3.4.3",
+
+    # Appels API HTTP
+    "requests>=2.31.0",
+
+    # Manipulation de données hors Spark
+    "pandas>=2.0.0",
+
+    # Parsing dates / heures
+    "python-dateutil>=2.8.2",
+
+    # Variables d'environnement (.env)
+    "python-dotenv>=1.0.0",
+
+    # Optionnel mais utile pour debug et logs
+    "loguru>=0.7.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
