@@ -1,5 +1,8 @@
 from typing import Dict, Any, Optional
 import requests
+from datetime import datetime
+import os
+import time
 
 DEFAULT_PARAMETRE = "precipitation"
 
@@ -87,3 +90,157 @@ def get_csv_from_command_id(command_id: int, token: str) -> Dict[Any, Any]:
     response.raise_for_status()
     return response.text
 
+def _find_station(
+    token: str,
+    latitude: float, 
+    longitude: float, 
+    departement_code: int,
+    date_deb: str,
+    date_fin: str
+) -> Optional[int]:
+    """
+    Trouve la station météo la plus proche pour des coordonnées données.
+    
+    Args:
+        latitude: Latitude
+        longitude: Longitude
+        departement_code: Code du département
+        date_deb: Date de début au format YYYY-MM-DD
+        date_fin: Date de fin au format YYYY-MM-DD
+    
+    Returns:
+        ID de la station la plus proche ou None
+    """
+    try:
+        stations_data = get_liste_stations_quotidienne(
+            id_departement=departement_code,
+            token=token
+        )
+        
+        if not stations_data and "data" not in stations_data:
+            return None
+        if "data" in stations_data:
+            stations = stations_data["data"]
+            if not stations:
+                return None
+        else:
+            stations = stations_data
+        
+        min_distance = float('inf')
+        nearest_station_id = None
+        
+        for station in stations:
+            if station.get("posteOuvert") == False:
+                continue
+            try:
+                station_id = station.get("id")
+                if not station_id:
+                    continue
+                
+                station_lat = station.get("lat")
+                station_lon = station.get("lon")
+                
+                if station_lat is not None and station_lon is not None:
+                    distance = ((latitude - station_lat) ** 2 + 
+                            (longitude - station_lon) ** 2) ** 0.5
+                    
+                    if distance < min_distance:
+                        info_station = get_information_station(station_id, token)[0]
+                        if info_station:
+                            start_date_meteo_dt = datetime.strptime(info_station.get("dateDebut"), "%Y-%m-%d %H:%M:%S")
+                            end_date_meteo_dt = info_station.get("dateFin")
+                            if end_date_meteo_dt == '' or end_date_meteo_dt == None:
+                                end_date_meteo_dt = datetime.now()
+                            else:
+                                end_date_meteo_dt = datetime.strptime(end_date_meteo_dt, "%Y-%m-%d %H:%M:%S") 
+                            if start_date_meteo_dt  <= datetime.strptime(date_deb, "%Y-%m-%d") and end_date_meteo_dt >= datetime.strptime(date_fin, "%Y-%m-%d"):
+                                min_distance = distance
+                                nearest_station_id = station_id
+                    else:
+                        continue
+
+            except Exception as e:
+                print(f"Erreur lors du traitement de la station {station_id}: {e}")
+                continue
+        
+        return nearest_station_id
+        
+    except Exception as e:
+        print(f"Erreur lors de la recherche de la station la plus proche: {e}")
+        return None
+
+def _get_weather_data(
+        token: str, 
+        station_id: int, 
+        date_debut: str, 
+        date_fin: str
+    ):
+        """
+        Récupère les données météo pour une station et une période données.
+        
+        Args:
+            station_id: ID de la station météo
+            date_debut: Date de début au format YYYY-MM-DD
+            date_fin: Date de fin au format YYYY-MM-DD
+        
+        Returns:
+            DataFrame Spark avec les données météo ou None
+        """
+        try:
+            command_response = command_station_data_quotidienne(
+                id_station=station_id,
+                date_deb_periode=date_debut,
+                date_fin_periode=date_fin,
+                token=token
+            )
+            
+            if not command_response:
+                print(f"Erreur: réponse vide")
+                return None
+            
+            try:
+                command_id = command_response.get('elaboreProduitAvecDemandeResponse', {}).get('return')
+                if not command_id:
+                    print(f"Erreur: pas d'ID de commande dans la réponse")
+                    print(f"Structure de la réponse: {command_response}")
+                    return None
+            except (KeyError, AttributeError) as e:
+                print(f"Erreur lors de l'extraction de l'ID de commande: {e}")
+                print(f"Structure de la réponse: {command_response}")
+                return None
+            
+            max_attempts = 1
+            attempt = 0
+            while attempt < max_attempts:
+                time.sleep(2)
+                
+                csv_data = get_csv_from_command_id(command_id, token)
+                if csv_data and len(csv_data) > 0:
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as tmp_file:
+                        tmp_file.write(csv_data)
+                        tmp_file_path = tmp_file.name
+                    
+                    try:
+                        import pandas as pd
+                        df_meteo = pd.read_csv(tmp_file_path, sep=';')
+                        df_meteo = df_meteo.replace(',', '.', regex=True)
+                        df_meteo = df_meteo.apply(pd.to_numeric, errors='coerce')
+                        df_meteo = df_meteo.dropna(axis=1, how='all')
+                        df_meteo = df_meteo.drop(columns=[col for col in df_meteo.columns if col.startswith('Q')])
+
+                        return df_meteo
+                    finally:
+                        try:
+                            os.unlink(tmp_file_path)
+                        except:
+                            pass
+                                    
+                attempt += 1
+            
+            print(f"Timeout: la commande {command_id} n'est pas prête après {max_attempts} tentatives")
+            return None
+            
+        except Exception as e:
+            print(f"Erreur lors de la récupération des données météo: {e}")
+            return None

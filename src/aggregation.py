@@ -9,16 +9,10 @@ import io
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
-load_dotenv()
 
 from sibil_manipulation import SIBILExtractor
 from get_coord_API import get_coordinates_from_addresses_batch
-from extract_meteo_API import (
-    get_liste_stations_quotidienne,
-    get_information_station,
-    command_station_data_quotidienne,
-    get_csv_from_command_id
-)
+from extract_meteo_API import _get_weather_data, _find_station
 
 
 class SIBILMeteoAggregator:
@@ -31,8 +25,8 @@ class SIBILMeteoAggregator:
     def __init__(self, meteo_token: str, geocodage_token: Optional[str] = None):
         """
         Initialise l'agrégateur.
-    
-    Args:
+        
+        Args:
             meteo_token: Token d'authentification pour l'API Météo-France
             geocodage_token: Token optionnel pour l'API de géocodage
         """
@@ -73,8 +67,6 @@ class SIBILMeteoAggregator:
     def _get_coordinates_udf(self):
         """
         Crée une UDF Spark pour récupérer les coordonnées d'une adresse.
-        Note: Cette UDF fait des appels API, donc elle peut être lente.
-        Pour de meilleures performances, on peut pré-géocoder les adresses uniques.
         
         Returns:
             UDF Spark qui retourne un struct avec latitude et longitude
@@ -114,34 +106,28 @@ class SIBILMeteoAggregator:
         Returns:
             DataFrame avec les colonnes latitude et longitude ajoutées
         """
-        # Construire l'adresse avec une UDF
         build_address = self._build_address_udf()
         df_with_address = df.withColumn(
             "full_address",
             build_address(col("lieu_adresse"), col("lieu_code_postal"), col("lieu_ville"))
         )
         
-        # Pour optimiser, on peut géocoder uniquement les adresses uniques
-        # puis faire un join
         unique_addresses_df = df_with_address.select("full_address").distinct()
         
         print(f"Géocodage de {unique_addresses_df.count()} adresses uniques...")
         
-        # Collecter les adresses uniques pour le géocodage batch
         unique_addresses = [row.full_address for row in unique_addresses_df.collect() if row.full_address]
         
         if not unique_addresses:
             return df_with_address.withColumn("latitude", lit(None).cast(DoubleType())) \
                                   .withColumn("longitude", lit(None).cast(DoubleType()))
         
-        # Géocoder par batch (plus efficace)
         print(f"Géocodage batch de {len(unique_addresses)} adresses...")
         coordinates = get_coordinates_from_addresses_batch(
             unique_addresses,
             token=self.geocodage_token
         )
         
-        # Créer un DataFrame de mapping adresse -> coordonnées
         coord_mapping_data = []
         for addr, coord in zip(unique_addresses, coordinates):
             if coord:
@@ -159,7 +145,6 @@ class SIBILMeteoAggregator:
         
         coord_mapping_df = self.extractor.spark.createDataFrame(coord_mapping_data)
         
-        # Joindre avec le DataFrame original
         df_with_coords = df_with_address.join(
             coord_mapping_df,
             on="full_address",
@@ -168,174 +153,6 @@ class SIBILMeteoAggregator:
         
         return df_with_coords
     
-    def _find_station(
-        self, 
-        latitude: float, 
-        longitude: float, 
-        departement_code: int,
-        date_deb: str,
-        date_fin: str
-    ) -> Optional[int]:
-        """
-        Trouve la station météo la plus proche pour des coordonnées données.
-        
-        Args:
-            latitude: Latitude
-            longitude: Longitude
-            departement_code: Code du département
-        
-        Returns:
-            ID de la station la plus proche ou None
-        """
-        try:
-            # Récupérer la liste des stations du département
-            stations_data = get_liste_stations_quotidienne(
-                id_departement=departement_code,
-                token=self.meteo_token
-            )
-            
-            if not stations_data and "data" not in stations_data:
-                return None
-            if "data" in stations_data:
-                stations = stations_data["data"]
-                if not stations:
-                    return None
-            else:
-                stations = stations_data
-            
-            # Calculer la distance pour chaque station et trouver la plus proche
-            min_distance = float('inf')
-            nearest_station_id = None
-            
-            for station in stations:
-                if station.get("posteOuvert") == False:
-                    continue
-                try:
-                    station_id = station.get("id")
-                    if not station_id:
-                        continue
-                    
-                    # Les coordonnées sont directement disponibles dans les données de la station
-                    station_lat = station.get("lat")
-                    station_lon = station.get("lon")
-                    
-                    if station_lat is not None and station_lon is not None:
-                        # Calculer la distance (formule de Haversine simplifiée)
-                        distance = ((latitude - station_lat) ** 2 + 
-                                   (longitude - station_lon) ** 2) ** 0.5
-                        
-                        if distance < min_distance:
-                            
-                            info_station = get_information_station(station_id, self.meteo_token)[0]
-                            if info_station:
-                                start_date_meteo_dt = datetime.strptime(info_station.get("dateDebut"), "%Y-%m-%d %H:%M:%S")
-                                end_date_meteo_dt = info_station.get("dateFin")
-                                if end_date_meteo_dt == '' or end_date_meteo_dt == None:
-                                    end_date_meteo_dt = datetime.now()
-                                else:
-                                    end_date_meteo_dt = datetime.strptime(end_date_meteo_dt, "%Y-%m-%d %H:%M:%S") 
-                                if start_date_meteo_dt  <= datetime.strptime(date_deb, "%Y-%m-%d") and end_date_meteo_dt >= datetime.strptime(date_fin, "%Y-%m-%d"):
-                                    min_distance = distance
-                                    nearest_station_id = station_id
-                        else:
-                            continue
-
-                except Exception as e:
-                    print(f"Erreur lors du traitement de la station {station_id}: {e}")
-                    continue
-            
-            return nearest_station_id
-            
-        except Exception as e:
-            print(f"Erreur lors de la recherche de la station la plus proche: {e}")
-            return None
-    
-    def _get_weather_data(
-        self, 
-        station_id: int, 
-        date_debut: str, 
-        date_fin: str
-    ) -> Optional[DataFrame]:
-        """
-        Récupère les données météo pour une station et une période données.
-        
-        Args:
-            station_id: ID de la station météo
-            date_debut: Date de début au format YYYY-MM-DD
-            date_fin: Date de fin au format YYYY-MM-DD
-        
-        Returns:
-            DataFrame Spark avec les données météo ou None
-        """
-        try:
-            # Commander les données météo
-            command_response = command_station_data_quotidienne(
-                id_station=station_id,
-                date_deb_periode=date_debut,
-                date_fin_periode=date_fin,
-                token=self.meteo_token
-            )
-            
-            # Extraire l'ID de commande de la réponse
-            # Structure: {'elaboreProduitAvecDemandeResponse': {'return': '2026000713302'}}
-            if not command_response:
-                print(f"Erreur: réponse vide")
-                return None
-            
-            try:
-                command_id = command_response.get('elaboreProduitAvecDemandeResponse', {}).get('return')
-                if not command_id:
-                    print(f"Erreur: pas d'ID de commande dans la réponse")
-                    print(f"Structure de la réponse: {command_response}")
-                    return None
-            except (KeyError, AttributeError) as e:
-                print(f"Erreur lors de l'extraction de l'ID de commande: {e}")
-                print(f"Structure de la réponse: {command_response}")
-                return None
-            
-            # Attendre que la commande soit prête (polling)
-            max_attempts = 1
-            attempt = 0
-            while attempt < max_attempts:
-                time.sleep(2)  # Attendre 2 secondes entre chaque tentative
-                
-                csv_data = get_csv_from_command_id(command_id, self.meteo_token)
-                if csv_data and len(csv_data) > 0:
-                    # Écrire le CSV dans un fichier temporaire
-                    # Créer un fichier temporaire
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as tmp_file:
-                        tmp_file.write(csv_data)
-                        tmp_file_path = tmp_file.name
-                    
-                    try:
-                        import pandas as pd
-                        df_meteo = pd.read_csv(tmp_file_path, sep=';')
-                        df_meteo = df_meteo.replace(',', '.', regex=True)
-
-                        df_meteo = df_meteo.apply(pd.to_numeric, errors='coerce')
-
-                        df_meteo = df_meteo.dropna(axis=1, how='all')
-
-                        df_meteo = df_meteo.drop(columns=[col for col in df_meteo.columns if col.startswith('Q')])
-                        spark_df_meteo = self.extractor.spark.createDataFrame(df_meteo)
-
-                        return spark_df_meteo
-                    finally:
-                        # Supprimer le fichier temporaire
-                        try:
-                            os.unlink(tmp_file_path)
-                        except:
-                            pass
-                                    
-                attempt += 1
-            
-            print(f"Timeout: la commande {command_id} n'est pas prête après {max_attempts} tentatives")
-            return None
-            
-        except Exception as e:
-            print(f"Erreur lors de la récupération des données météo: {e}")
-            return None
     
     def aggregate_sibil_meteo(
         self,
@@ -347,8 +164,8 @@ class SIBILMeteoAggregator:
     ) -> DataFrame:
         """
         Agrège les données SIBIL avec les données météo.
-    
-    Args:
+        
+        Args:
             csv_path: Chemin vers le fichier CSV SIBIL
             filters: Dictionnaire de filtres pour SIBIL {colonne: valeur}
             sibil_columns: Liste de colonnes SIBIL à conserver
@@ -360,20 +177,17 @@ class SIBILMeteoAggregator:
         Returns:
             DataFrame Spark avec les données SIBIL et météo agrégées
         """
-        # Colonnes SIBIL par défaut si non spécifiées
         if sibil_columns is None:
             sibil_columns = [
                 "festival_nom", "lieu_nom", "lieu_adresse", "lieu_code_postal", 
                 "lieu_ville", "lieu_departement_code", "declaration_date_representation"
             ]
         
-        # Ajouter les colonnes nécessaires pour construire l'adresse
         required_columns = ["lieu_adresse", "lieu_code_postal", "lieu_ville", "lieu_departement_code"]
         for col_name in required_columns:
             if col_name not in sibil_columns:
                 sibil_columns.append(col_name)
         
-        # Récupérer les données SIBIL filtrées
         print("Extraction des données SIBIL...")
         df_sibil = self.extractor.extract_SIBIL_filtered(
             csv_path=csv_path,
@@ -381,7 +195,6 @@ class SIBILMeteoAggregator:
             columns=sibil_columns
         )
         
-        # Filtrer les lignes avec des adresses valides
         df_sibil = df_sibil.filter(
             (col("lieu_adresse").isNotNull()) & 
             (col("lieu_adresse") != "null") &
@@ -389,16 +202,13 @@ class SIBILMeteoAggregator:
             (col("lieu_ville") != "null")
         )
         
-        # Ajouter les coordonnées
         print("Ajout des coordonnées géographiques...")
         df_with_coords = self._get_coordinates_for_df(df_sibil)
         
-        # Filtrer les lignes avec des coordonnées valides
         df_with_coords = df_with_coords.filter(
             col("latitude").isNotNull() & col("longitude").isNotNull()
         )
         
-        # Ajouter une colonne pour calculer les dates de début et fin
         def parse_date_udf():
             """UDF pour parser les dates."""
             def parse_date(date_str: str, default_date: str) -> str:
@@ -412,8 +222,6 @@ class SIBILMeteoAggregator:
                         continue
                 return default_date
             return udf(parse_date, StringType())
-        
-        # Calculer les dates de début et fin
         default_date_deb = date_debut if date_debut else (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         default_date_fin = date_fin if date_fin else datetime.now().strftime("%Y-%m-%d")
         
@@ -442,7 +250,6 @@ class SIBILMeteoAggregator:
             )
         )
         
-        # Filtrer les lignes avec coordonnées valides
         df_valid = df_with_dates.filter(
             col("latitude").isNotNull() & 
             col("longitude").isNotNull() &
@@ -451,11 +258,6 @@ class SIBILMeteoAggregator:
         
         print(f"Traitement de {df_valid.count()} événements SIBIL avec données météo...")
         
-        # Pour optimiser, on va traiter par groupes uniques (station, dates)
-        # On va collecter les combinaisons uniques (lat, lon, dept, date_deb, date_fin) et traiter par batch
-        # Cela évite de récupérer plusieurs fois les mêmes données météo
-        
-        # Créer un identifiant unique pour chaque combinaison station/date
         df_with_station_key = df_valid.withColumn(
             "station_key",
             concat_ws("_",
@@ -467,7 +269,6 @@ class SIBILMeteoAggregator:
             )
         )
         
-        # Collecter les combinaisons uniques pour optimiser les appels API
         unique_combinations = df_with_station_key.select(
             "station_key", "latitude", "longitude", "lieu_departement_code", 
             "date_debut_meteo", "date_fin_meteo"
@@ -475,7 +276,6 @@ class SIBILMeteoAggregator:
         
         print(f"Traitement de {len(unique_combinations)} combinaisons uniques station/date...")
         
-        # Dictionnaire pour stocker les données météo par clé
         meteo_data_cache = {}
         
         for idx, combo in enumerate(unique_combinations, 1):
@@ -487,17 +287,16 @@ class SIBILMeteoAggregator:
             date_f = combo.date_fin_meteo
             key = combo.station_key
             
-            # Trouver la station
             print(f"  → Recherche station pour ({lat}, {lon}) dans le département {dept}...")
-            station_id = self._find_station(float(lat), float(lon), int(dept), date_deb, date_f)
+            station_id = _find_station(self.meteo_token, float(lat), float(lon), int(dept), date_deb, date_f)
             
             if not station_id:
                 print(f"  → Aucune station trouvée")
                 continue
             
-            # Récupérer les données météo
             print(f"  → Station: {station_id}, Période: {date_deb} à {date_f}")
-            meteo_df = self._get_weather_data(station_id, date_deb, date_f)
+            meteo_data = _get_weather_data(self.meteo_token, station_id, date_deb, date_f)
+            meteo_df : DataFrame = self.extractor.spark.createDataFrame(meteo_data.to_dict(orient="records"))
             
             if len(meteo_df.columns) > 2:
                 meteo_data_cache[key] = (station_id, meteo_df)
@@ -506,56 +305,46 @@ class SIBILMeteoAggregator:
                 meteo_data_cache[key] = (station_id, None)
                 print(f"  → Aucune donnée météo disponible")
             
-            time.sleep(1)  # Délai pour éviter de surcharger les APIs
+            time.sleep(1)
         
-        # Maintenant, joindre les données météo avec le DataFrame SIBIL
-        # Pour chaque combinaison unique, on va créer un DataFrame avec les données météo
         all_meteo_dfs = []
         
         for key, (station_id, meteo_df) in meteo_data_cache.items():
             if len(meteo_df.columns) > 2:
-                # Ajouter la clé et l'ID de station aux données météo
                 meteo_with_key = meteo_df.withColumn("station_key", lit(key)) \
                                          .withColumn("station_id", lit(station_id))
                 all_meteo_dfs.append(meteo_with_key)
         
         if all_meteo_dfs:
-            # Union de tous les DataFrames météo
             from functools import reduce
             meteo_union = reduce(DataFrame.unionByName, all_meteo_dfs)
             
-            # Joindre avec le DataFrame SIBIL
             final_df = df_with_station_key.join(
                 meteo_union,
                 on="station_key",
                 how="left"
             ).drop("station_key")
         else:
-            # Pas de données météo, juste ajouter station_id
             final_df = df_with_station_key.withColumn("station_id", lit(None).cast(IntegerType())) \
                                           .drop("station_key")
         
         return final_df
 
 
-# Exemple d'utilisation
 if __name__ == "__main__":
-    from dotenv import load_dotenv
     load_dotenv()
     
     csv_path = "data/raw_sibil/Export_SIBIL_dataculture.csv"
     meteo_token = os.getenv("TOK")
-    geocodage_token = os.getenv("GEOPF_TOKEN")  # Optionnel
+    geocodage_token = os.getenv("GEOPF_TOKEN")
     
     if not meteo_token:
         raise ValueError("METEO_FRANCE_TOKEN doit être défini dans le fichier .env")
     
-    # Utiliser l'agrégateur avec context manager
     with SIBILMeteoAggregator(meteo_token=meteo_token, geocodage_token=geocodage_token) as aggregator:
-        # Agrégation avec filtres
         df_result = aggregator.aggregate_sibil_meteo(
             csv_path=csv_path,
-            filters={"festival_nom": "monatgne et nature "},  # Exemple: Haute-Garonne
+            filters={"festival_nom": "monatgne et nature "},
             sibil_columns=[
                 "festival_nom", "lieu_nom", "lieu_adresse", 
                 "lieu_code_postal", "lieu_ville", "lieu_departement_code",
@@ -566,5 +355,4 @@ if __name__ == "__main__":
         print(f"Nombre de lignes dans le résultat: {df_result.count()}")
         df_result.show(20, truncate=False)
         
-        # Sauvegarder le résultat
         df_result.write.mode("overwrite").parquet("data/processed/sibil_meteo_aggregated.parquet")
