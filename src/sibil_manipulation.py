@@ -190,7 +190,7 @@ if __name__ == "__main__":
         df_filtered = extractor.extract_SIBIL_filtered(
             csv_path,
             filters={"festival_nom": "monatgne et nature "},
-            # columns=["festival_date_creation", "lieu_date_creation","declaration_date_representation","festival_nom", "lieu_nom", "lieu_adresse", "lieu_ville", "festival_nom_parent", "declarant_nom", "declarant_nom_usuel", "lieu_departement_code"]
+            columns=["festival_date_creation", "lieu_date_creation","declaration_date_representation","festival_nom", "lieu_nom", "lieu_adresse", "lieu_ville", "festival_nom_parent", "declarant_nom", "declarant_nom_usuel", "lieu_departement_code"]
         )
         print(df_filtered[0]['lieu_adresse'])
         df_filtered.show(10)

@@ -294,43 +294,40 @@ class SIBILMeteoAggregator:
                 return None
             
             # Attendre que la commande soit prête (polling)
-            max_attempts = 5
+            max_attempts = 1
             attempt = 0
             while attempt < max_attempts:
                 time.sleep(2)  # Attendre 2 secondes entre chaque tentative
-                try:
-                    csv_data = get_csv_from_command_id(command_id, self.meteo_token)
-                    if csv_data and len(csv_data) > 0:
-                        # Parser le CSV et créer un DataFrame
-                        csv_reader = csv.DictReader(io.StringIO(csv_data))
-                        rows = list(csv_reader)
-                        
-                        if rows:
-                            # Nettoyer les données : remplacer None par des chaînes vides
-                            cleaned_rows = []
-                            for row in rows:
-                                cleaned_row = {}
-                                for key, value in row.items():
-                                    # Remplacer None, 'None', ou chaînes vides par une chaîne vide
-                                    if value is None or value == 'None' or value == '':
-                                        cleaned_row[key] = ''
-                                    else:
-                                        cleaned_row[key] = str(value)  # S'assurer que tout est une string
-                                cleaned_rows.append(cleaned_row)
-                            
-                            # Créer un DataFrame Spark avec les données nettoyées
-                            meteo_df = self.extractor.spark.createDataFrame(cleaned_rows)
-                            return meteo_df
-
-                except Exception as e:
-                    # La commande n'est peut-être pas encore prête
-                    if "404" in str(e) or "not found" in str(e).lower():
-                        attempt += 1
-                        continue
-                    else:
-                        print(f"Erreur lors de la récupération du CSV: {e}")
-                        return None
                 
+                csv_data = get_csv_from_command_id(command_id, self.meteo_token)
+                if csv_data and len(csv_data) > 0:
+                    # Écrire le CSV dans un fichier temporaire
+                    # Créer un fichier temporaire
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as tmp_file:
+                        tmp_file.write(csv_data)
+                        tmp_file_path = tmp_file.name
+                    
+                    try:
+                        import pandas as pd
+                        df_meteo = pd.read_csv(tmp_file_path, sep=';')
+                        df_meteo = df_meteo.replace(',', '.', regex=True)
+
+                        df_meteo = df_meteo.apply(pd.to_numeric, errors='coerce')
+
+                        df_meteo = df_meteo.dropna(axis=1, how='all')
+
+                        df_meteo = df_meteo.drop(columns=[col for col in df_meteo.columns if col.startswith('Q')])
+                        spark_df_meteo = self.extractor.spark.createDataFrame(df_meteo)
+
+                        return spark_df_meteo
+                    finally:
+                        # Supprimer le fichier temporaire
+                        try:
+                            os.unlink(tmp_file_path)
+                        except:
+                            pass
+                                    
                 attempt += 1
             
             print(f"Timeout: la commande {command_id} n'est pas prête après {max_attempts} tentatives")
@@ -502,7 +499,7 @@ class SIBILMeteoAggregator:
             print(f"  → Station: {station_id}, Période: {date_deb} à {date_f}")
             meteo_df = self._get_weather_data(station_id, date_deb, date_f)
             
-            if meteo_df:
+            if len(meteo_df.columns) > 2:
                 meteo_data_cache[key] = (station_id, meteo_df)
                 print(f"  → {meteo_df.count()} jours de données météo récupérées")
             else:
@@ -516,7 +513,7 @@ class SIBILMeteoAggregator:
         all_meteo_dfs = []
         
         for key, (station_id, meteo_df) in meteo_data_cache.items():
-            if meteo_df:
+            if len(meteo_df.columns) > 2:
                 # Ajouter la clé et l'ID de station aux données météo
                 meteo_with_key = meteo_df.withColumn("station_key", lit(key)) \
                                          .withColumn("station_id", lit(station_id))
@@ -543,7 +540,6 @@ class SIBILMeteoAggregator:
 
 # Exemple d'utilisation
 if __name__ == "__main__":
-    import os
     from dotenv import load_dotenv
     load_dotenv()
     

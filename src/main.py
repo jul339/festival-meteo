@@ -21,20 +21,22 @@ def main():
     # pprint.pprint(station)
     # print(TOKEN)
 
-    departement = 31
-    stations = get_liste_stations_quotidienne(departement, TOKEN, )
-    print(f"Nombre de stations trouvées: {len(stations) if isinstance(stations, list) else 'N/A'}")
-    df = pd.DataFrame(stations)
-    df.to_csv("data/stations_quotidienne_31.csv", index=False)
+    # departement = 31
+    # stations = get_liste_stations_quotidienne(departement, TOKEN, )
+    # print(f"Nombre de stations trouvées: {len(stations) if isinstance(stations, list) else 'N/A'}")
+    # df = pd.DataFrame(stations)
+    # df.to_csv("data/stations_quotidienne_31.csv", index=False)
 
     
     # df = pd.read_csv("data/stations_quotidienne_31.csv")
     # id = df[df["posteOuvert"]].iloc[0]["id"]
-    # station = command_station_data_quotidienne(id, "2024-01-01", "2024-01-02", TOKEN)
-    # print(len(station))
-    # pprint.pprint(station, depth=4)
+    station = command_station_data_quotidienne(31424001, "2025-11-28", "2025-12-05", TOKEN)
+    print(len(station))
+    pprint.pprint(station, depth=4)
 
-    # csv = get_csv_from_command_id(2026000606328, TOKEN)
+    # csv = get_csv_from_command_id(2026000865041, TOKEN)
+    # # df = pd.read_csv(csv)
+    # pprint.pprint(csv)
     # with open("data/raw_meteo/test.csv", "w") as f:
     #     f.write(csv)
 
