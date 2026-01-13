@@ -210,7 +210,6 @@ def _get_weather_data(
         max_attempts = 1
         attempt = 0
         while attempt < max_attempts:
-            time.sleep(2)
 
             csv_data = get_csv_from_command_id(command_id, token)
             if csv_data and len(csv_data) > 0:

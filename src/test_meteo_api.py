@@ -9,12 +9,8 @@ import pprint
 
 
 from extract_meteo_API import (
-    get_liste_stations_quotidienne,
-    get_information_station,
     command_station_data_quotidienne,
-    get_csv_from_command_id,
 )
-from get_coord_API import get_coordinates_from_addresses_batch
 
 TOKEN = os.getenv("TOK")
 if not TOKEN:

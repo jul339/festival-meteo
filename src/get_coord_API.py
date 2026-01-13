@@ -106,16 +106,6 @@ def get_coordinates_from_addresses_batch(
 def get_coordinates_for_df(
     unique_addresses: List[str], token: Optional[str] = None
 ) -> list[str]:
-    """
-    Ajoute les coordonnées (latitude, longitude) au DataFrame SIBIL.
-    Utilise une approche optimisée avec Spark pour gérer les adresses uniques.
-
-    Args:
-        df: DataFrame Spark avec les données SIBIL
-
-    Returns:
-        DataFrame avec les colonnes latitude et longitude ajoutées
-    """
 
     if not unique_addresses:
         raise ValueError("Aucune adresse trouvée")

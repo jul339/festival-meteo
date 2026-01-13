@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import col, when, isnan, isnull
+from pyspark.sql.functions import col, concat_ws, trim
 from pyspark.sql.types import (
     StructType,
     StructField,
@@ -122,6 +122,7 @@ class SIBILExtractor:
                 StructField("lieu_cause_erreur_adresse", StringType(), True),
             ]
         )
+
         df = (
             self.spark.read.option("header", "true")
             .option("schema", schema)
@@ -144,14 +145,43 @@ class SIBILExtractor:
 
         return df
 
+    def transform_sibil_addresses(
+        self, df_sibil: DataFrame
+    ) -> tuple[DataFrame, list[str]]:
 
-def write_csv_unique_festivals_names(df: DataFrame) -> list[str]:
-    """
-    Écrit un fichier CSV avec les noms de festivals uniques d'un DataFrame SIBIL.
-    """
-    df.select("festival_nom").distinct().write.csv(
-        "data/unique_festivals_names.csv", header=True
-    )
+        df_sibil = df_sibil.filter(
+            (col("lieu_adresse").isNotNull())
+            & (col("lieu_adresse") != "null")
+            & (col("lieu_ville").isNotNull())
+            & (col("lieu_ville") != "null")
+        )
+
+        df_with_address = df_sibil.withColumn(
+            "full_address",
+            concat_ws(
+                ", ",
+                trim(col("lieu_adresse")),
+                trim(col("lieu_code_postal")),
+                trim(col("lieu_ville")),
+            ),
+        )
+
+        unique_addresses_df = df_with_address.select("full_address").distinct()
+        unique_addresses = [
+            row.full_address
+            for row in unique_addresses_df.collect()
+            if row.full_address
+        ]
+
+        return df_with_address, unique_addresses
+
+    def write_csv_unique_festivals_names(df: DataFrame) -> list[str]:
+        """
+        Écrit un fichier CSV avec les noms de festivals uniques d'un DataFrame SIBIL.
+        """
+        df.select("festival_nom").distinct().write.csv(
+            "data/unique_festivals_names.csv", header=True
+        )
 
 
 # Exemple d'utilisation

@@ -5,7 +5,6 @@ from pyspark.sql.functions import col, concat_ws, lit, trim
 from pyspark.sql.types import IntegerType
 from typing import Dict, List, Optional, Any
 from functools import reduce
-
 from dotenv import load_dotenv
 
 from sibil_manipulation import SIBILExtractor
@@ -84,36 +83,17 @@ class SIBILMeteoAggregator:
             csv_path=csv_path, filters=filters, columns=sibil_columns
         )
 
-        df_sibil = df_sibil.filter(
-            (col("lieu_adresse").isNotNull())
-            & (col("lieu_adresse") != "null")
-            & (col("lieu_ville").isNotNull())
-            & (col("lieu_ville") != "null")
+        df_with_address, unique_addresses = self.extractor.transform_sibil_addresses(
+            df_sibil
         )
-
-        print("Ajout des coordonnées géographiques...")
-        df_with_address = df_sibil.withColumn(
-            "full_address",
-            concat_ws(
-                ", ",
-                trim(col("lieu_adresse")),
-                trim(col("lieu_code_postal")),
-                trim(col("lieu_ville")),
-            ),
-        )
-
-        unique_addresses_df = df_with_address.select("full_address").distinct()
-        unique_addresses = [
-            row.full_address
-            for row in unique_addresses_df.collect()
-            if row.full_address
-        ]
 
         coord_mapping_data: list[dict] = get_coordinates_for_df(
             unique_addresses, token=self.geocodage_token
         )
 
-        coord_mapping_df = self.extractor.spark.createDataFrame(coord_mapping_data)
+        coord_mapping_df: DataFrame = self.extractor.spark.createDataFrame(
+            coord_mapping_data
+        )
 
         df_with_coords = df_with_address.join(
             coord_mapping_df, on="full_address", how="left"
@@ -131,10 +111,6 @@ class SIBILMeteoAggregator:
             col("latitude").isNotNull()
             & col("longitude").isNotNull()
             & col("lieu_departement_code").isNotNull()
-        )
-
-        print(
-            f"Traitement de {df_valid.count()} événements SIBIL avec données météo..."
         )
 
         df_with_station_key = df_valid.withColumn(
@@ -188,21 +164,17 @@ class SIBILMeteoAggregator:
             print(
                 f"  → Station: {station_id}, Date de représentation: {day_representation}"
             )
-            import pandas as pd
 
-            meteo_data: pd.DataFrame = _get_weather_data(
+            meteo_data = _get_weather_data(
                 self.meteo_token, station_id, day_representation
             )
             meteo_df: DataFrame = self.extractor.spark.createDataFrame(meteo_data)
 
             if len(meteo_df.columns) > 2:
                 meteo_data_cache[key] = (station_id, meteo_df)
-                print(f"  → {meteo_df.count()} jours de données météo récupérées")
             else:
                 meteo_data_cache[key] = (station_id, None)
                 print(f"  → Aucune donnée météo disponible")
-
-            time.sleep(1)
 
         all_meteo_dfs = []
 
