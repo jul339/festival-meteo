@@ -15,21 +15,12 @@ requires-python = ">=3.9,<3.11"
 dependencies = [
     # PySpark (compatible Java 11)
     "pyspark==3.4.3",
-
-    # Appels API HTTP
     "requests>=2.31.0",
-
-    # Manipulation de données hors Spark
     "pandas>=2.0.0",
-
-    # Parsing dates / heures
     "python-dateutil>=2.8.2",
-
-    # Variables d'environnement (.env)
     "python-dotenv>=1.0.0",
-
-    # Optionnel mais utile pour debug et logs
-    "loguru>=0.7.0"
+    "loguru>=0.7.0",
+    "black>=25.11.0",
 ]
 
 [tool.setuptools.packages.find]
