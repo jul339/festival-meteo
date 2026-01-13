@@ -5,8 +5,11 @@ import requests
 from datetime import datetime
 import os
 import time
+from io import StringIO
+import logging as log
 
 DEFAULT_PARAMETRE = "precipitation"
+log.basicConfig(level=log.INFO)
 
 
 def get_liste_stations_quotidienne(
@@ -28,17 +31,17 @@ def get_liste_stations_quotidienne(
         response.raise_for_status()  # Lève une exception pour les codes d'erreur HTTP
         return response.json()
     except requests.exceptions.HTTPError as e:
-        print(f"Erreur HTTP lors de la récupération des données: {e}")
+        log.error(f"Erreur HTTP lors de la récupération des données: {e}")
         if e.response is not None:
-            print(f"Code de statut: {e.response.status_code}")
+            log.error(f"Code de statut: {e.response.status_code}")
             try:
                 error_detail = e.response.json()
-                print(f"Détails de l'erreur: {error_detail}")
+                log.error(f"Détails de l'erreur: {error_detail}")
             except:
-                print(f"Réponse: {e.response.text}")
+                log.error(f"Réponse: {e.response.text}")
         raise
     except requests.exceptions.RequestException as e:
-        print(f"Erreur lors de la récupération des données: {e}")
+        log.error(f"Erreur lors de la récupération des données: {e}")
         raise
 
 
@@ -110,7 +113,7 @@ def _find_station(
             id_departement=departement_code, token=token
         )
 
-        if not stations_data and "data" not in stations_data:
+        if not stations_data:
             return None
         if "data" in stations_data:
             stations = stations_data["data"]
@@ -121,6 +124,7 @@ def _find_station(
 
         min_distance = float("inf")
         nearest_station_id = None
+        day_dt = datetime.strptime(day_representation, "%d-%m-%Y")
 
         for station in stations:
             if station.get("posteOuvert") == False:
@@ -151,10 +155,9 @@ def _find_station(
                                 end_date_meteo_dt = datetime.strptime(
                                     end_date_meteo_dt, "%Y-%m-%d %H:%M:%S"
                                 )
-                            if start_date_meteo_dt <= datetime.strptime(
-                                day_representation, "%d-%m-%Y"
-                            ) and end_date_meteo_dt >= datetime.strptime(
-                                day_representation, "%d-%m-%Y"
+                            if (
+                                start_date_meteo_dt <= day_dt
+                                and end_date_meteo_dt >= day_dt
                             ):
                                 min_distance = distance
                                 nearest_station_id = station_id
@@ -162,13 +165,13 @@ def _find_station(
                         continue
 
             except Exception as e:
-                print(f"Erreur lors du traitement de la station {station_id}: {e}")
+                log.error(f"Erreur lors du traitement de la station {station_id}: {e}")
                 continue
 
         return nearest_station_id
 
     except Exception as e:
-        print(f"Erreur lors de la recherche de la station la plus proche: {e}")
+        log.error(f"Erreur lors de la recherche de la station la plus proche: {e}")
         return None
 
 
@@ -191,7 +194,7 @@ def _get_weather_data(
         )
 
         if not command_response:
-            print(f"Erreur: réponse vide")
+            log.error(f"Erreur: réponse vide")
             return None
 
         try:
@@ -199,51 +202,50 @@ def _get_weather_data(
                 "elaboreProduitAvecDemandeResponse", {}
             ).get("return")
             if not command_id:
-                print(f"Erreur: pas d'ID de commande dans la réponse")
-                print(f"Structure de la réponse: {command_response}")
+                log.error(
+                    f"Erreur: pas d'ID de commande dans la réponse, structure de la réponse: {command_response}"
+                )
                 return None
         except (KeyError, AttributeError) as e:
-            print(f"Erreur lors de l'extraction de l'ID de commande: {e}")
-            print(f"Structure de la réponse: {command_response}")
+            log.error(f"Erreur lors de l'extraction de l'ID de commande: {e}")
+            log.error(f"Structure de la réponse: {command_response}")
             return None
 
-        max_attempts = 1
-        attempt = 0
-        while attempt < max_attempts:
+        max_attempts = 2
+        for attempt in range(max_attempts):
+            try:
+                csv_data = get_csv_from_command_id(command_id, token)
+            except Exception as e:
+                log.error(f"Erreur lors de la récupération des données météo: {e}")
+                csv_data = ""
 
-            csv_data = get_csv_from_command_id(command_id, token)
-            if csv_data and len(csv_data) > 0:
-                import tempfile
-
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".csv", delete=False, encoding="utf-8"
-                ) as tmp_file:
-                    tmp_file.write(csv_data)
-                    tmp_file_path = tmp_file.name
-
+            if csv_data and len(csv_data.strip()) > 0:
                 try:
-                    df_meteo = pd.read_csv(tmp_file_path, sep=";")
-                    df_meteo = df_meteo.replace(",", ".", regex=True)
-                    df_meteo = df_meteo.apply(pd.to_numeric, errors="coerce")
-                    df_meteo = df_meteo.dropna(axis=1, how="all")
-                    df_meteo = df_meteo.drop(
-                        columns=[col for col in df_meteo.columns if col.startswith("Q")]
+                    df_meteo = pd.read_csv(
+                        StringIO(csv_data),
+                        sep=";",
+                        decimal=",",
+                        na_values=["", "NA", "NaN", "null", "None"],
+                        keep_default_na=True,
                     )
+                except Exception as e:
+                    log.error(f"Erreur lors de la lecture du fichier CSV: {e}")
+                    df_meteo = None
 
+                if df_meteo is not None and not df_meteo.empty:
+                    df_meteo = df_meteo.dropna(axis=1, how="all")
+                    q_cols = [c for c in df_meteo.columns if str(c).startswith("Q")]
+                    if q_cols:
+                        df_meteo = df_meteo.drop(columns=q_cols, errors="ignore")
                     return df_meteo
-                finally:
-                    try:
-                        os.unlink(tmp_file_path)
-                    except:
-                        pass
 
-            attempt += 1
+            time.sleep(min(2**attempt, 20))
 
-        print(
+        log.error(
             f"Timeout: la commande {command_id} n'est pas prête après {max_attempts} tentatives"
         )
         return None
 
     except Exception as e:
-        print(f"Erreur lors de la récupération des données météo: {e}")
+        log.error(f"Erreur lors de la récupération des données météo: {e}")
         return None

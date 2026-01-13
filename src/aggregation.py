@@ -1,7 +1,8 @@
 from pyspark.sql import SparkSession, DataFrame
 import os
 import time
-from pyspark.sql.functions import col, concat_ws, lit, trim
+import pandas as pd
+from pyspark.sql.functions import col, concat_ws, lit, broadcast
 from pyspark.sql.types import IntegerType
 from typing import Dict, List, Optional, Any
 from functools import reduce
@@ -96,7 +97,7 @@ class SIBILMeteoAggregator:
         )
 
         df_with_coords = df_with_address.join(
-            coord_mapping_df, on="full_address", how="left"
+            broadcast(coord_mapping_df), on="full_address", how="left"
         ).drop("full_address")
 
         df_with_coords = df_with_coords.filter(
@@ -133,14 +134,11 @@ class SIBILMeteoAggregator:
                 "day_representation",
             )
             .distinct()
-            .collect()
+            .toLocalIterator()
         )
 
-        print(
-            f"Traitement de {len(unique_combinations)} combinaisons uniques station/date..."
-        )
-
-        meteo_data_cache = {}
+        meteo_cache: dict[tuple[int, str], Any] = {}
+        meteo_frames: list[Any] = []
 
         for combo in unique_combinations:
             lat = combo.latitude
@@ -165,29 +163,31 @@ class SIBILMeteoAggregator:
                 f"  → Station: {station_id}, Date de représentation: {day_representation}"
             )
 
-            meteo_data = _get_weather_data(
-                self.meteo_token, station_id, day_representation
-            )
-            meteo_df: DataFrame = self.extractor.spark.createDataFrame(meteo_data)
-
-            if len(meteo_df.columns) > 2:
-                meteo_data_cache[key] = (station_id, meteo_df)
+            meteo_key = (int(station_id), str(day_representation))
+            if meteo_key in meteo_cache:
+                meteo_data = meteo_cache[meteo_key]
             else:
-                meteo_data_cache[key] = (station_id, None)
+                meteo_data = _get_weather_data(
+                    self.meteo_token, int(station_id), str(day_representation)
+                )
+                meteo_cache[meteo_key] = meteo_data
+
+            if meteo_data is None:
                 print(f"  → Aucune donnée météo disponible")
+                continue
 
-        all_meteo_dfs = []
+            if hasattr(meteo_data, "empty") and meteo_data.empty:
+                print(f"  → Aucune donnée météo disponible")
+                continue
 
-        for key, (station_id, meteo_df) in meteo_data_cache.items():
-            if len(meteo_df.columns) > 2:
-                meteo_with_key = meteo_df.withColumn(
-                    "station_key", lit(key)
-                ).withColumn("station_id", lit(station_id))
-                all_meteo_dfs.append(meteo_with_key)
+            meteo_data = meteo_data.copy()
+            meteo_data["station_key"] = key
+            meteo_data["station_id"] = int(station_id)
+            meteo_frames.append(meteo_data)
 
-        if all_meteo_dfs:
-            meteo_union = reduce(DataFrame.unionByName, all_meteo_dfs)
-
+        if meteo_frames:
+            meteo_pd = pd.concat(meteo_frames, ignore_index=True, sort=False)
+            meteo_union = self.extractor.spark.createDataFrame(meteo_pd)
             final_df = df_with_station_key.join(
                 meteo_union, on="station_key", how="left"
             ).drop("station_key")
@@ -226,8 +226,8 @@ if __name__ == "__main__":
             ],
         )
 
-        print(f"Nombre de lignes dans le résultat: {df_result.count()}")
-        df_result.show(20, truncate=False)
+        # print(f"Nombre de lignes dans le résultat: {df_result.count()}")
+        df_result.show(20, truncate=True)
 
         df_result.write.mode("overwrite").parquet(
             "data/processed/sibil_meteo_aggregated.parquet"

@@ -1,11 +1,21 @@
 import requests
 import csv
 import io
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, List, Iterable, Iterator, Sequence
+
+try:
+    # urllib3 est une dépendance indirecte de requests (habituellement présente)
+    from urllib3.util.retry import Retry
+except Exception:  # pragma: no cover
+    Retry = None  # type: ignore[assignment]
+
+from requests.adapters import HTTPAdapter
 
 
 def get_coordinates_from_addresses_batch(
-    addresses: List[str], token: Optional[str] = None, column_name: str = "address"
+    addresses: List[str],
+    token: Optional[str] = None,
+    column_name: str = "address",
 ) -> List[Optional[Tuple[float, float]]]:
     """
     Récupère les coordonnées (latitude, longitude) pour plusieurs adresses
@@ -103,24 +113,58 @@ def get_coordinates_from_addresses_batch(
         return [None] * len(addresses)
 
 
-def get_coordinates_for_df(
-    unique_addresses: List[str], token: Optional[str] = None
-) -> list[str]:
+def _chunked(values: Iterable[str], chunk_size: int) -> Iterator[List[str]]:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size doit être > 0")
+    buff: List[str] = []
+    for v in values:
+        if v is None:
+            continue
+        v = str(v).strip()
+        if not v:
+            continue
+        buff.append(v)
+        if len(buff) >= chunk_size:
+            yield buff
+            buff = []
+    if buff:
+        yield buff
 
-    if not unique_addresses:
+
+def get_coordinates_for_df(
+    unique_addresses: Iterable[str],
+    token: Optional[str] = None,
+    chunk_size: int = 1000,
+) -> list[dict]:
+
+    coord_mapping_data: list[dict] = []
+    missing: list[str] = []
+    total = 0
+
+    for chunk in _chunked(unique_addresses, chunk_size=chunk_size):
+        total += len(chunk)
+        print(f"Géocodage batch: {len(chunk)} adresses (cumul={total})...")
+
+        coordinates = get_coordinates_from_addresses_batch(chunk, token=token)
+
+        for idx, addr in enumerate(chunk):
+            coord = coordinates[idx] if idx < len(coordinates) else None
+            if coord:
+                coord_mapping_data.append(
+                    {"full_address": addr, "latitude": coord[0], "longitude": coord[1]}
+                )
+            else:
+                missing.append(addr)
+
+    if total == 0:
         raise ValueError("Aucune adresse trouvée")
 
-    print(f"Géocodage batch de {len(unique_addresses)} adresses...")
+    if missing:
+        examples = ", ".join(repr(a) for a in missing[:10])
+        more = "" if len(missing) <= 10 else f" (+{len(missing) - 10} autres)"
+        raise ValueError(
+            f"Aucune coordonnée trouvée pour {len(missing)} adresse(s) sur {total}. "
+            f"Exemples: {examples}{more}"
+        )
 
-    coordinates = get_coordinates_from_addresses_batch(unique_addresses, token=token)
-
-    coord_mapping_data = []
-    for idx, addr in enumerate(unique_addresses):
-        coord = coordinates[idx] if idx < len(coordinates) else None
-        if coord:
-            coord_mapping_data.append(
-                {"full_address": addr, "latitude": coord[0], "longitude": coord[1]}
-            )
-        else:
-            raise ValueError(f"Aucune coordonnée trouvée pour l'adresse {addr}")
     return coord_mapping_data
