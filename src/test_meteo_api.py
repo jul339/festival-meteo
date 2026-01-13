@@ -30,7 +30,7 @@ def main():
     
     # df = pd.read_csv("data/stations_quotidienne_31.csv")
     # id = df[df["posteOuvert"]].iloc[0]["id"]
-    station = command_station_data_quotidienne(31424001, "2025-11-28", "2025-12-05", TOKEN)
+    station = command_station_data_quotidienne(31424001, "2025-11-28", TOKEN)
     print(len(station))
     pprint.pprint(station, depth=4)
 

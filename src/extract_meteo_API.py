@@ -58,12 +58,13 @@ def get_information_station(id_station: int, token: str) -> Dict[Any, Any]:
     response.raise_for_status()
     return response.json()
 
-def command_station_data_quotidienne(id_station: int, date_deb_periode: str, date_fin_periode: str, token: str) -> Dict[Any, Any]:
+def command_station_data_quotidienne(id_station: int, day_representation: str, token: str) -> Dict[Any, Any]:
     base_url = "https://public-api.meteofrance.fr/public/DPClim/v1"
     endpoint = "/commande-station/quotidienne"
     url = f"{base_url}{endpoint}"
-    date_deb_periode += "T00:00:00Z"
-    date_fin_periode += "T00:00:00Z"
+    day_representation = datetime.strptime(day_representation, "%d-%m-%Y").strftime("%Y-%m-%d")
+    date_deb_periode = day_representation + "T00:00:00Z"
+    date_fin_periode = day_representation + "T23:59:59Z"
     params = {
         "id-station": id_station,
         "date-deb-periode": date_deb_periode,
@@ -95,8 +96,7 @@ def _find_station(
     latitude: float, 
     longitude: float, 
     departement_code: int,
-    date_deb: str,
-    date_fin: str
+    day_representation: str,
 ) -> Optional[int]:
     """
     Trouve la station météo la plus proche pour des coordonnées données.
@@ -105,8 +105,7 @@ def _find_station(
         latitude: Latitude
         longitude: Longitude
         departement_code: Code du département
-        date_deb: Date de début au format YYYY-MM-DD
-        date_fin: Date de fin au format YYYY-MM-DD
+        day_representation: Date de représentation au format YYYY-MM-DD
     
     Returns:
         ID de la station la plus proche ou None
@@ -153,7 +152,7 @@ def _find_station(
                                 end_date_meteo_dt = datetime.now()
                             else:
                                 end_date_meteo_dt = datetime.strptime(end_date_meteo_dt, "%Y-%m-%d %H:%M:%S") 
-                            if start_date_meteo_dt  <= datetime.strptime(date_deb, "%Y-%m-%d") and end_date_meteo_dt >= datetime.strptime(date_fin, "%Y-%m-%d"):
+                            if start_date_meteo_dt  <= datetime.strptime(day_representation, "%d-%m-%Y") and end_date_meteo_dt >= datetime.strptime(day_representation, "%d-%m-%Y"):
                                 min_distance = distance
                                 nearest_station_id = station_id
                     else:
@@ -172,16 +171,14 @@ def _find_station(
 def _get_weather_data(
         token: str, 
         station_id: int, 
-        date_debut: str, 
-        date_fin: str
+        day_representation: str
     ):
         """
         Récupère les données météo pour une station et une période données.
         
         Args:
             station_id: ID de la station météo
-            date_debut: Date de début au format YYYY-MM-DD
-            date_fin: Date de fin au format YYYY-MM-DD
+            day_representation: Date de représentation au format YYYY-MM-DD
         
         Returns:
             DataFrame Spark avec les données météo ou None
@@ -189,8 +186,7 @@ def _get_weather_data(
         try:
             command_response = command_station_data_quotidienne(
                 id_station=station_id,
-                date_deb_periode=date_debut,
-                date_fin_periode=date_fin,
+                day_representation=day_representation,
                 token=token
             )
             

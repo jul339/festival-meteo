@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import col, concat_ws, lit, when, isnan, isnull, udf, explode, array, struct
+from pyspark.sql.functions import col, concat_ws, lit, trim, udf
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, DateType, ArrayType
 from typing import Dict, List, Optional, Tuple, Any
 import os
@@ -23,17 +23,18 @@ class SIBILMeteoAggregator:
     """
     
     def __init__(self, meteo_token: str, geocodage_token: Optional[str] = None):
-        """
-        Initialise l'agrégateur.
-        
-        Args:
-            meteo_token: Token d'authentification pour l'API Météo-France
-            geocodage_token: Token optionnel pour l'API de géocodage
-        """
         self.meteo_token = meteo_token
         self.geocodage_token = geocodage_token
-        self.extractor = SIBILExtractor()
-    
+        
+        # Créer la session Spark centralisée
+        self.spark = SparkSession.builder \
+            .appName("SIBIL_Meteo_Aggregation") \
+            .config("spark.sql.adaptive.enabled", "true") \
+            .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+            .getOrCreate()
+        
+        self.extractor = SIBILExtractor(spark=self.spark)
+
     def __enter__(self):
         """Support pour le context manager."""
         return self
@@ -42,60 +43,9 @@ class SIBILMeteoAggregator:
         """Arrête Spark à la sortie du context manager."""
         self.extractor.stop()
     
-    def _build_address_udf(self):
-        """
-        Crée une UDF Spark pour construire une adresse complète.
-        
-        Returns:
-            UDF Spark
-        """
-        def build_address(adresse: str, code_postal: str, ville: str) -> str:
-            """Construit une adresse complète."""
-            address_parts = []
-            
-            if adresse and str(adresse).strip() not in ["null", "None", "", None]:
-                address_parts.append(str(adresse).strip())
-            if code_postal and str(code_postal).strip() not in ["null", "None", "", None]:
-                address_parts.append(str(code_postal).strip())
-            if ville and str(ville).strip() not in ["null", "None", "", None]:
-                address_parts.append(str(ville).strip())
-            
-            return ", ".join(address_parts) if address_parts else None
-        
-        return udf(build_address, StringType())
+
     
-    def _get_coordinates_udf(self):
-        """
-        Crée une UDF Spark pour récupérer les coordonnées d'une adresse.
-        
-        Returns:
-            UDF Spark qui retourne un struct avec latitude et longitude
-        """
-        def get_coords(address: str) -> Optional[Tuple[float, float]]:
-            """Récupère les coordonnées d'une adresse."""
-            if not address or address in ["null", "None", ""]:
-                return None
-            
-            try:
-                coords = get_coordinates_from_addresses_batch(
-                    [address], 
-                    token=self.geocodage_token
-                )
-                if coords and coords[0]:
-                    return coords[0]
-                return None
-            except Exception as e:
-                print(f"Erreur lors du géocodage de {address}: {e}")
-                return None
-        
-        coord_schema = StructType([
-            StructField("latitude", DoubleType(), True),
-            StructField("longitude", DoubleType(), True)
-        ])
-        
-        return udf(get_coords, coord_schema)
-    
-    def _get_coordinates_for_df(self, df: DataFrame) -> DataFrame:
+    def _get_coordinates_for_df(self, unique_addresses: List[str]) -> list[str]:
         """
         Ajoute les coordonnées (latitude, longitude) au DataFrame SIBIL.
         Utilise une approche optimisée avec Spark pour gérer les adresses uniques.
@@ -106,30 +56,21 @@ class SIBILMeteoAggregator:
         Returns:
             DataFrame avec les colonnes latitude et longitude ajoutées
         """
-        build_address = self._build_address_udf()
-        df_with_address = df.withColumn(
-            "full_address",
-            build_address(col("lieu_adresse"), col("lieu_code_postal"), col("lieu_ville"))
-        )
-        
-        unique_addresses_df = df_with_address.select("full_address").distinct()
-        
-        print(f"Géocodage de {unique_addresses_df.count()} adresses uniques...")
-        
-        unique_addresses = [row.full_address for row in unique_addresses_df.collect() if row.full_address]
+
         
         if not unique_addresses:
-            return df_with_address.withColumn("latitude", lit(None).cast(DoubleType())) \
-                                  .withColumn("longitude", lit(None).cast(DoubleType()))
-        
+            raise ValueError("Aucune adresse trouvée")
+
         print(f"Géocodage batch de {len(unique_addresses)} adresses...")
+
         coordinates = get_coordinates_from_addresses_batch(
             unique_addresses,
             token=self.geocodage_token
         )
         
         coord_mapping_data = []
-        for addr, coord in zip(unique_addresses, coordinates):
+        for idx, addr in enumerate(unique_addresses):
+            coord = coordinates[idx] if idx < len(coordinates) else None
             if coord:
                 coord_mapping_data.append({
                     "full_address": addr,
@@ -137,21 +78,9 @@ class SIBILMeteoAggregator:
                     "longitude": coord[1]
                 })
             else:
-                coord_mapping_data.append({
-                    "full_address": addr,
-                    "latitude": None,
-                    "longitude": None
-                })
+                raise ValueError(f"Aucune coordonnée trouvée pour l'adresse {addr}")
+        return coord_mapping_data
         
-        coord_mapping_df = self.extractor.spark.createDataFrame(coord_mapping_data)
-        
-        df_with_coords = df_with_address.join(
-            coord_mapping_df,
-            on="full_address",
-            how="left"
-        ).drop("full_address")
-        
-        return df_with_coords
     
     
     def aggregate_sibil_meteo(
@@ -159,8 +88,6 @@ class SIBILMeteoAggregator:
         csv_path: str,
         filters: Dict[str, Any] = None,
         sibil_columns: List[str] = None,
-        date_debut: Optional[str] = None,
-        date_fin: Optional[str] = None
     ) -> DataFrame:
         """
         Agrège les données SIBIL avec les données météo.
@@ -169,11 +96,6 @@ class SIBILMeteoAggregator:
             csv_path: Chemin vers le fichier CSV SIBIL
             filters: Dictionnaire de filtres pour SIBIL {colonne: valeur}
             sibil_columns: Liste de colonnes SIBIL à conserver
-            date_debut: Date de début pour les données météo (YYYY-MM-DD). 
-                       Si None, utilise la date de représentation de la déclaration
-            date_fin: Date de fin pour les données météo (YYYY-MM-DD).
-                     Si None, utilise date_debut + 7 jours
-        
         Returns:
             DataFrame Spark avec les données SIBIL et météo agrégées
         """
@@ -189,7 +111,7 @@ class SIBILMeteoAggregator:
                 sibil_columns.append(col_name)
         
         print("Extraction des données SIBIL...")
-        df_sibil = self.extractor.extract_SIBIL_filtered(
+        df_sibil : DataFrame = self.extractor.extract_SIBIL_filtered(
             csv_path=csv_path,
             filters=filters,
             columns=sibil_columns
@@ -203,54 +125,36 @@ class SIBILMeteoAggregator:
         )
         
         print("Ajout des coordonnées géographiques...")
-        df_with_coords = self._get_coordinates_for_df(df_sibil)
+        df_with_address = df_sibil.withColumn(
+            "full_address",
+            concat_ws(", ",
+                trim(col("lieu_adresse")),
+                trim(col("lieu_code_postal")),
+                trim(col("lieu_ville"))
+            )
+        )
         
+        unique_addresses_df = df_with_address.select("full_address").distinct()
+        unique_addresses = [row.full_address for row in unique_addresses_df.collect() if row.full_address]
+
+        coord_mapping_data = self._get_coordinates_for_df(unique_addresses)
+        
+        
+        coord_mapping_df = self.extractor.spark.createDataFrame(coord_mapping_data)
+        
+        df_with_coords = df_with_address.join(
+            coord_mapping_df,
+            on="full_address",
+            how="left"
+        ).drop("full_address")
+
         df_with_coords = df_with_coords.filter(
             col("latitude").isNotNull() & col("longitude").isNotNull()
         )
         
-        def parse_date_udf():
-            """UDF pour parser les dates."""
-            def parse_date(date_str: str, default_date: str) -> str:
-                if not date_str or str(date_str) in ["null", "None", ""]:
-                    return default_date
-                date_str = str(date_str).split()[0]
-                for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y"]:
-                    try:
-                        return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
-                    except:
-                        continue
-                return default_date
-            return udf(parse_date, StringType())
-        default_date_deb = date_debut if date_debut else (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-        default_date_fin = date_fin if date_fin else datetime.now().strftime("%Y-%m-%d")
+        df_date_rename = df_with_coords.withColumnRenamed("declaration_date_representation", "day_representation")
         
-        parse_date = parse_date_udf()
-        df_with_dates = df_with_coords.withColumn(
-            "date_debut_meteo",
-            when(
-                lit(date_debut).isNotNull(),
-                lit(date_debut)
-            ).otherwise(
-                when(
-                    col("declaration_date_representation").isNotNull(),
-                    parse_date(col("declaration_date_representation"), lit(default_date_deb))
-                ).otherwise(lit(default_date_deb))
-            )
-        ).withColumn(
-            "date_fin_meteo",
-            when(
-                lit(date_fin).isNotNull(),
-                lit(date_fin)
-            ).otherwise(
-                when(
-                    col("date_debut_meteo").isNotNull(),
-                    (col("date_debut_meteo").cast("date") + lit(7).cast("int")).cast("string")
-                ).otherwise(lit(default_date_fin))
-            )
-        )
-        
-        df_valid = df_with_dates.filter(
+        df_valid = df_date_rename.filter(
             col("latitude").isNotNull() & 
             col("longitude").isNotNull() &
             col("lieu_departement_code").isNotNull()
@@ -264,38 +168,36 @@ class SIBILMeteoAggregator:
                 col("latitude").cast("string"),
                 col("longitude").cast("string"),
                 col("lieu_departement_code").cast("string"),
-                col("date_debut_meteo"),
-                col("date_fin_meteo")
+                col("day_representation"),
             )
         )
         
         unique_combinations = df_with_station_key.select(
             "station_key", "latitude", "longitude", "lieu_departement_code", 
-            "date_debut_meteo", "date_fin_meteo"
+            "day_representation"
         ).distinct().collect()
         
         print(f"Traitement de {len(unique_combinations)} combinaisons uniques station/date...")
         
         meteo_data_cache = {}
         
-        for idx, combo in enumerate(unique_combinations, 1):
-            print(f"\nTraitement de la combinaison {idx}/{len(unique_combinations)}...")
+        for combo in unique_combinations:
             lat = combo.latitude
             lon = combo.longitude
             dept = combo.lieu_departement_code
-            date_deb = combo.date_debut_meteo
-            date_f = combo.date_fin_meteo
+            day_representation = combo.day_representation
             key = combo.station_key
+            print(f"  → Traitement de la combinaison {key}...")
             
             print(f"  → Recherche station pour ({lat}, {lon}) dans le département {dept}...")
-            station_id = _find_station(self.meteo_token, float(lat), float(lon), int(dept), date_deb, date_f)
+            station_id = _find_station(self.meteo_token, float(lat), float(lon), int(dept), day_representation)
             
             if not station_id:
                 print(f"  → Aucune station trouvée")
                 continue
             
-            print(f"  → Station: {station_id}, Période: {date_deb} à {date_f}")
-            meteo_data = _get_weather_data(self.meteo_token, station_id, date_deb, date_f)
+            print(f"  → Station: {station_id}, Date de représentation: {day_representation}")
+            meteo_data = _get_weather_data(self.meteo_token, station_id, day_representation)
             meteo_df : DataFrame = self.extractor.spark.createDataFrame(meteo_data.to_dict(orient="records"))
             
             if len(meteo_df.columns) > 2:

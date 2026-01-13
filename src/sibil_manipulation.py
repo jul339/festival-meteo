@@ -1,9 +1,9 @@
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import col, when, isnan, isnull
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DateType, LongType, BooleanType
 import os
 
-
+from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -12,14 +12,23 @@ class SIBILExtractor:
     """
     Classe pour extraire et traiter des fichiers CSV SIBIL avec PySpark.
     """
-    def __init__(self):
-        """Initialise une session Spark pour l'extraction."""
-        self.spark : SparkSession = SparkSession.builder \
-            .appName("SIBIL_Extraction") \
-            .config("spark.sql.adaptive.enabled", "true") \
-            .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-            .getOrCreate()
-        self.spark_created_here = True
+    def __init__(self, spark: Optional[SparkSession] = None):
+        """
+        Initialise l'extracteur SIBIL.
+        
+        Args:
+            spark: Session Spark optionnelle. Si None, en crée une nouvelle.
+        """
+        if spark is None:
+            self.spark = SparkSession.builder \
+                .appName("SIBIL_Extraction") \
+                .config("spark.sql.adaptive.enabled", "true") \
+                .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+                .getOrCreate()
+            self.spark_created_here = True
+        else:
+            self.spark = spark
+            self.spark_created_here = False
     
     def __enter__(self):
         """Support pour le context manager (with statement)."""
@@ -41,7 +50,7 @@ class SIBILExtractor:
         csv_path: str,
         filters: dict = None,
         columns: list = None
-    ):
+    ) -> DataFrame:
         """
         Extrait un CSV avec filtres et sélection de colonnes.
         
